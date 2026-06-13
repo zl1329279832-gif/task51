@@ -22,6 +22,7 @@ import org.springframework.util.DigestUtils;
 import java.math.BigDecimal;
 import java.util.Date;
 import java.util.List;
+import java.util.concurrent.TimeUnit;
 
 /**
  * @auther TyCoding
@@ -36,6 +37,8 @@ public class SeckillServiceImpl implements SeckillService {
     private final String salt = "sjajaspu-i-2jrfm;sd";
     //设置秒杀redis缓存的key
     private final String key = "seckill";
+    //缓存过期时间（秒），防止缓存与数据库不一致
+    private static final long CACHE_TTL_SECONDS = 60;
 
     @Autowired
     private SeckillMapper seckillMapper;
@@ -48,7 +51,7 @@ public class SeckillServiceImpl implements SeckillService {
 
     @Override
     public List<Seckill> findAll() {
-        List<Seckill> seckillList = redisTemplate.boundHashOps("seckill").values();
+        List<Seckill> seckillList = redisTemplate.boundHashOps(key).values();
         if (seckillList == null || seckillList.size() == 0){
             //说明缓存中没有秒杀列表数据
             //查询数据库中秒杀列表数据，并将列表数据循环放入redis缓存中
@@ -56,8 +59,10 @@ public class SeckillServiceImpl implements SeckillService {
             for (Seckill seckill : seckillList){
                 //将秒杀列表数据依次放入redis缓存中，key:秒杀表的ID值；value:秒杀商品数据
                 redisTemplate.boundHashOps(key).put(seckill.getSeckillId(), seckill);
-                logger.info("findAll -> 从数据库中读取放入缓存中");
             }
+            //设置缓存过期时间，防止与数据库数据不一致
+            redisTemplate.expire(key, CACHE_TTL_SECONDS, TimeUnit.SECONDS);
+            logger.info("findAll -> 从数据库中读取放入缓存中");
         }else{
             logger.info("findAll -> 从缓存中读取");
         }
@@ -66,35 +71,42 @@ public class SeckillServiceImpl implements SeckillService {
 
     @Override
     public Seckill findById(long seckillId) {
-        return seckillMapper.findById(seckillId);
+        //优先从缓存读取，保证详情页与exposer数据源一致
+        Seckill seckill = (Seckill) redisTemplate.boundHashOps(key).get(seckillId);
+        if (seckill == null) {
+            seckill = seckillMapper.findById(seckillId);
+            if (seckill != null) {
+                redisTemplate.boundHashOps(key).put(seckill.getSeckillId(), seckill);
+                redisTemplate.expire(key, CACHE_TTL_SECONDS, TimeUnit.SECONDS);
+            }
+        }
+        return seckill;
     }
 
     @Override
     public Exposer exportSeckillUrl(long seckillId) {
-        Seckill seckill = (Seckill) redisTemplate.boundHashOps(key).get(seckillId);
+        //时间边界判断必须从数据库读取，避免缓存中时间字段过期导致状态不准
+        Seckill seckill = seckillMapper.findById(seckillId);
         if (seckill == null) {
-            //说明redis缓存中没有此key对应的value
-            //查询数据库，并将数据放入缓存中
-            seckill = seckillMapper.findById(seckillId);
-            if (seckill == null) {
-                //说明没有查询到
-                return new Exposer(false, seckillId);
-            } else {
-                //查询到了，存入redis缓存中。 key:秒杀表的ID值； value:秒杀表数据
-                redisTemplate.boundHashOps(key).put(seckill.getSeckillId(), seckill);
-                logger.info("RedisTemplate -> 从数据库中读取并放入缓存中");
-            }
-        } else {
-            logger.info("RedisTemplate -> 从缓存中读取");
+            return new Exposer(false, seckillId);
         }
+        //用数据库最新数据刷新缓存
+        redisTemplate.boundHashOps(key).put(seckill.getSeckillId(), seckill);
+        redisTemplate.expire(key, CACHE_TTL_SECONDS, TimeUnit.SECONDS);
+
         Date startTime = seckill.getStartTime();
         Date endTime = seckill.getEndTime();
-        //获取系统时间
         Date nowTime = new Date();
+
         if (nowTime.getTime() < startTime.getTime() || nowTime.getTime() > endTime.getTime()) {
             return new Exposer(false, seckillId, nowTime.getTime(), startTime.getTime(), endTime.getTime());
         }
-        //转换特定字符串的过程，不可逆的算法
+
+        //库存检查：库存耗尽时不再暴露秒杀地址
+        if (seckill.getStockCount() <= 0) {
+            return new Exposer(false, seckillId, nowTime.getTime(), startTime.getTime(), endTime.getTime());
+        }
+
         String md5 = getMD5(seckillId);
         return new Exposer(true, md5, seckillId);
     }
@@ -122,34 +134,48 @@ public class SeckillServiceImpl implements SeckillService {
         if (md5 == null || !md5.equals(getMD5(seckillId))) {
             throw new SeckillException("seckill data rewrite");
         }
-        //执行秒杀逻辑：1.减库存；2.储存秒杀订单
+
         Date nowTime = new Date();
 
         try {
-            //记录秒杀订单信息
-            int insertCount = seckillOrderMapper.insertOrder(seckillId, money, userPhone);
+            //先从数据库校验时间窗口和库存，防止活动结束后仍可用旧md5扣库存
+            Seckill seckill = seckillMapper.findById(seckillId);
+            if (seckill == null) {
+                throw new SeckillCloseException("seckill is closed");
+            }
+            if (nowTime.getTime() < seckill.getStartTime().getTime()
+                    || nowTime.getTime() > seckill.getEndTime().getTime()) {
+                throw new SeckillCloseException("seckill is closed");
+            }
+            if (seckill.getStockCount() <= 0) {
+                throw new SeckillCloseException("seckill is closed");
+            }
+
+            //先减库存（SQL中包含时间与库存的二次校验）
+            int updateCount = seckillMapper.reduceStock(seckillId, nowTime);
+            if (updateCount <= 0) {
+                throw new SeckillCloseException("seckill is closed");
+            }
+
+            //再记录秒杀订单信息
             //唯一性：seckillId,userPhone，保证一个用户只能秒杀一件商品
+            int insertCount = seckillOrderMapper.insertOrder(seckillId, money, userPhone);
             if (insertCount <= 0) {
                 //重复秒杀
                 throw new RepeatKillException("seckill repeated");
-            } else {
-                //减库存
-                int updateCount = seckillMapper.reduceStock(seckillId, nowTime);
-                if (updateCount <= 0) {
-                    //没有更新记录，秒杀结束
-                    throw new SeckillCloseException("seckill is closed");
-                } else {
-                    //秒杀成功
-                    SeckillOrder seckillOrder = seckillOrderMapper.findById(seckillId, userPhone);
-
-                    //更新缓存（更新库存数量）
-                    Seckill seckill = (Seckill) redisTemplate.boundHashOps(key).get(seckillId);
-                    seckill.setStockCount(seckill.getSeckillId() - 1);
-                    redisTemplate.boundHashOps(key).put(seckillId, seckill);
-
-                    return new SeckillExecution(seckillId, SeckillStatEnum.SUCCESS, seckillOrder);
-                }
             }
+
+            //秒杀成功
+            SeckillOrder seckillOrder = seckillOrderMapper.findById(seckillId, userPhone);
+
+            //更新缓存（用数据库最新库存刷新，避免缓存与数据库不一致）
+            Seckill updated = seckillMapper.findById(seckillId);
+            if (updated != null) {
+                redisTemplate.boundHashOps(key).put(seckillId, updated);
+                redisTemplate.expire(key, CACHE_TTL_SECONDS, TimeUnit.SECONDS);
+            }
+
+            return new SeckillExecution(seckillId, SeckillStatEnum.SUCCESS, seckillOrder);
         } catch (SeckillCloseException e) {
             throw e;
         } catch (RepeatKillException e) {
