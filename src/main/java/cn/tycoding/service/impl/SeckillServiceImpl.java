@@ -8,6 +8,7 @@ import cn.tycoding.enums.SeckillStatEnum;
 import cn.tycoding.exception.RepeatKillException;
 import cn.tycoding.exception.SeckillCloseException;
 import cn.tycoding.exception.SeckillException;
+import cn.tycoding.exception.SeckillNotStartedException;
 import cn.tycoding.mapper.SeckillMapper;
 import cn.tycoding.mapper.SeckillOrderMapper;
 import cn.tycoding.service.SeckillService;
@@ -22,6 +23,7 @@ import org.springframework.util.DigestUtils;
 import java.math.BigDecimal;
 import java.util.Date;
 import java.util.List;
+import java.util.concurrent.TimeUnit;
 
 /**
  * @auther TyCoding
@@ -37,6 +39,11 @@ public class SeckillServiceImpl implements SeckillService {
     //设置秒杀redis缓存的key
     private final String key = "seckill";
 
+    // 秒杀列表缓存过期时间（秒）：5分钟
+    private static final int SECKILL_LIST_TTL_SECONDS = 300;
+    // 单个秒杀商品缓存过期时间（秒）：1分钟
+    private static final int SECKILL_ITEM_TTL_SECONDS = 60;
+
     @Autowired
     private SeckillMapper seckillMapper;
 
@@ -49,16 +56,18 @@ public class SeckillServiceImpl implements SeckillService {
     @Override
     public List<Seckill> findAll() {
         List<Seckill> seckillList = redisTemplate.boundHashOps("seckill").values();
-        if (seckillList == null || seckillList.size() == 0){
+        if (seckillList == null || seckillList.isEmpty()) {
             //说明缓存中没有秒杀列表数据
             //查询数据库中秒杀列表数据，并将列表数据循环放入redis缓存中
             seckillList = seckillMapper.findAll();
-            for (Seckill seckill : seckillList){
+            for (Seckill seckill : seckillList) {
                 //将秒杀列表数据依次放入redis缓存中，key:秒杀表的ID值；value:秒杀商品数据
                 redisTemplate.boundHashOps(key).put(seckill.getSeckillId(), seckill);
-                logger.info("findAll -> 从数据库中读取放入缓存中");
             }
-        }else{
+            // 设置缓存过期时间，防止缓存永不过期导致数据不一致
+            redisTemplate.expire(key, SECKILL_LIST_TTL_SECONDS, TimeUnit.SECONDS);
+            logger.info("findAll -> 从数据库中读取放入缓存中，TTL={}s", SECKILL_LIST_TTL_SECONDS);
+        } else {
             logger.info("findAll -> 从缓存中读取");
         }
         return seckillList;
@@ -82,17 +91,21 @@ public class SeckillServiceImpl implements SeckillService {
             } else {
                 //查询到了，存入redis缓存中。 key:秒杀表的ID值； value:秒杀表数据
                 redisTemplate.boundHashOps(key).put(seckill.getSeckillId(), seckill);
-                logger.info("RedisTemplate -> 从数据库中读取并放入缓存中");
+                // 设置缓存过期时间，确保时间窗口和库存数据不会永久过期
+                redisTemplate.expire(key, SECKILL_ITEM_TTL_SECONDS, TimeUnit.SECONDS);
+                logger.info("exportSeckillUrl -> 从数据库中读取并放入缓存中，TTL={}s", SECKILL_ITEM_TTL_SECONDS);
             }
         } else {
-            logger.info("RedisTemplate -> 从缓存中读取");
+            logger.info("exportSeckillUrl -> 从缓存中读取");
         }
+
         Date startTime = seckill.getStartTime();
         Date endTime = seckill.getEndTime();
-        //获取系统时间
-        Date nowTime = new Date();
-        if (nowTime.getTime() < startTime.getTime() || nowTime.getTime() > endTime.getTime()) {
-            return new Exposer(false, seckillId, nowTime.getTime(), startTime.getTime(), endTime.getTime());
+        // 使用System.currentTimeMillis()获取更精确的系统时间
+        long nowTime = System.currentTimeMillis();
+        // 时间窗口判断：startTime <= now <= endTime 时秒杀开启
+        if (nowTime < startTime.getTime() || nowTime > endTime.getTime()) {
+            return new Exposer(false, seckillId, nowTime, startTime.getTime(), endTime.getTime());
         }
         //转换特定字符串的过程，不可逆的算法
         String md5 = getMD5(seckillId);
@@ -122,8 +135,23 @@ public class SeckillServiceImpl implements SeckillService {
         if (md5 == null || !md5.equals(getMD5(seckillId))) {
             throw new SeckillException("seckill data rewrite");
         }
-        //执行秒杀逻辑：1.减库存；2.储存秒杀订单
-        Date nowTime = new Date();
+
+        // Java端时间窗口校验：在执行数据库操作前先判断时间是否有效，
+        // 防止活动结束后旧MD5仍可通过校验并触发数据库操作
+        long nowTime = System.currentTimeMillis();
+        Seckill cached = (Seckill) redisTemplate.boundHashOps(key).get(seckillId);
+        if (cached != null) {
+            if (nowTime < cached.getStartTime().getTime()) {
+                throw new SeckillNotStartedException("seckill not started");
+            }
+            if (nowTime > cached.getEndTime().getTime()) {
+                throw new SeckillCloseException("seckill is closed");
+            }
+        }
+        // 如果缓存中没有数据，依赖后续SQL中reduceStock的时间窗口条件兜底
+
+        //执行秒杀逻辑：1.储存秒杀订单；2.减库存
+        Date killTime = new Date(nowTime);
 
         try {
             //记录秒杀订单信息
@@ -134,23 +162,26 @@ public class SeckillServiceImpl implements SeckillService {
                 throw new RepeatKillException("seckill repeated");
             } else {
                 //减库存
-                int updateCount = seckillMapper.reduceStock(seckillId, nowTime);
+                int updateCount = seckillMapper.reduceStock(seckillId, killTime);
                 if (updateCount <= 0) {
-                    //没有更新记录，秒杀结束
+                    //没有更新记录，秒杀结束（库存为0或不在时间窗口内）
                     throw new SeckillCloseException("seckill is closed");
                 } else {
                     //秒杀成功
                     SeckillOrder seckillOrder = seckillOrderMapper.findById(seckillId, userPhone);
 
-                    //更新缓存（更新库存数量）
-                    Seckill seckill = (Seckill) redisTemplate.boundHashOps(key).get(seckillId);
-                    seckill.setStockCount(seckill.getSeckillId() - 1);
-                    redisTemplate.boundHashOps(key).put(seckillId, seckill);
+                    //更新缓存（更新库存数量）—— 修复原bug: 使用stockCount而非seckillId
+                    if (cached != null) {
+                        cached.setStockCount(cached.getStockCount() - 1);
+                        redisTemplate.boundHashOps(key).put(seckillId, cached);
+                    }
 
                     return new SeckillExecution(seckillId, SeckillStatEnum.SUCCESS, seckillOrder);
                 }
             }
         } catch (SeckillCloseException e) {
+            throw e;
+        } catch (SeckillNotStartedException e) {
             throw e;
         } catch (RepeatKillException e) {
             throw e;

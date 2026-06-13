@@ -8,6 +8,7 @@ import cn.tycoding.enums.SeckillStatEnum;
 import cn.tycoding.exception.RepeatKillException;
 import cn.tycoding.exception.SeckillCloseException;
 import cn.tycoding.exception.SeckillException;
+import cn.tycoding.exception.SeckillNotStartedException;
 import cn.tycoding.service.SeckillService;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -92,6 +93,9 @@ public class SeckillController {
             return new SeckillResult<SeckillExecution>(true, execution);
         } catch (RepeatKillException e) {
             SeckillExecution seckillExecution = new SeckillExecution(seckillId, SeckillStatEnum.REPEAT_KILL);
+            return new SeckillResult<SeckillExecution>(true, seckillExecution);
+        } catch (SeckillNotStartedException e) {
+            SeckillExecution seckillExecution = new SeckillExecution(seckillId, SeckillStatEnum.NOT_STARTED);
             return new SeckillResult<SeckillExecution>(true, seckillExecution);
         } catch (SeckillCloseException e) {
             SeckillExecution seckillExecution = new SeckillExecution(seckillId, SeckillStatEnum.END);

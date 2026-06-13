@@ -21,4 +21,8 @@
         AND stock_count &gt; 0
     </update>
 
+    <select id="findStockById" resultType="java.lang.Long">
+        SELECT stock_count FROM seckill WHERE seckill_id = #{seckillId}
+    </select>
+
 </mapper>

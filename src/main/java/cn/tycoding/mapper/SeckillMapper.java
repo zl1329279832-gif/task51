@@ -38,4 +38,12 @@ public interface SeckillMapper {
      * @return 返回此SQL更新的记录数，如果>=1表示更新成功
      */
     int reduceStock(@Param("seckillId") long seckillId, @Param("killTime") Date killTime);
+
+    /**
+     * 根据ID查询秒杀商品的库存数量（轻量查询，不加载全部字段）
+     *
+     * @param seckillId 秒杀商品ID
+     * @return 当前库存数量，如果商品不存在返回null
+     */
+    Long findStockById(@Param("seckillId") long seckillId);
 }
