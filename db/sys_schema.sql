@@ -8,6 +8,7 @@
 
 DROP TABLE IF EXISTS `seckill`;
 DROP TABLE IF EXISTS `seckill_order`;
+DROP TABLE IF EXISTS `seckill_reservation`;
 
 -- 创建秒杀商品表
 CREATE TABLE `seckill`(
@@ -35,5 +36,17 @@ CREATE TABLE `seckill_order`(
   `state` tinyint NOT NULL DEFAULT -1 COMMENT '状态：-1无效 0成功 1已付款',
   PRIMARY KEY (`seckill_id`, `user_phone`) /*联合主键，保证一个用户只能秒杀一件商品*/
 ) CHARSET=utf8 ENGINE=InnoDB COMMENT '秒杀订单表';
+
+-- 创建秒杀预约提醒表
+CREATE TABLE `seckill_reservation`(
+  `id` bigint NOT NULL AUTO_INCREMENT COMMENT '主键ID',
+  `seckill_id` bigint NOT NULL COMMENT '秒杀商品ID',
+  `user_phone` bigint NOT NULL COMMENT '用户手机号',
+  `status` tinyint NOT NULL DEFAULT 0 COMMENT '状态：0-待提醒 1-已提醒',
+  `create_time` timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
+  PRIMARY KEY (`id`),
+  UNIQUE KEY `uk_seckill_user` (`seckill_id`, `user_phone`),
+  KEY `idx_seckill_status` (`seckill_id`, `status`)
+) CHARSET=utf8 ENGINE=InnoDB COMMENT '秒杀预约提醒表';
 
 
